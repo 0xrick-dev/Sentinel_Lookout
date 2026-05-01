@@ -1,0 +1,19 @@
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Sentinel Lookout — generated audit artifacts
+SentinelDiagnosticsAudit_*.csv
+SentinelDiagnosticsAudit_*.html
+SentinelDCRAudit_*.csv
+SentinelDCRAudit_*.html
+
+# PowerShell transcripts / logs
+*.log
+PowerShell_transcript.*
