@@ -21,7 +21,7 @@
     Project : Sentinel Lookout
     Author  : Predrag (Peter) Petrovic <ppetrovic@microsoft.com>
     License : MIT
-    Repo    : https://github.com/0xrick-dev/sentinel-lookout
+    Repo    : https://github.com/0xrick-dev/Sentinel_Lookout
 
     Run from Azure Cloud Shell (PowerShell). Requires Az modules (preinstalled in Cloud Shell).
     Reader on each subscription is sufficient. No Microsoft Graph calls are made.
@@ -42,6 +42,16 @@ $env:SuppressAzurePowerShellBreakingChangeWarnings = 'true'
 # DCR + DCRA stable GA API version.
 $DcrApiVersion  = '2022-06-01'
 $DcraApiVersion = '2022-06-01'
+
+# Companion CSV listing every VM-like resource and whether it is associated with any DCR.
+$VmOutputPath = [System.IO.Path]::Combine(
+    [System.IO.Path]::GetDirectoryName($OutputPath),
+    [System.IO.Path]::GetFileNameWithoutExtension($OutputPath) + '_VMs.csv'
+)
+
+$vmResults    = New-Object System.Collections.Generic.List[object]
+# Map: lowercased resourceId -> list of DCR rows that associate it
+$assocIndex   = @{}
 
 # ---------------------------------------------------------------------------
 # 0. Sanity check
@@ -319,6 +329,19 @@ foreach ($sub in $subscriptions) {
                     if ($idx -gt 0) {
                         $targetId = $a.id.Substring(0, $idx)
                         $assocResourceIds   += $targetId
+
+                        # Track which DCRs each target is associated with (used later
+                        # to find VMs that have no DCR association at all).
+                        $key = $targetId.ToLower()
+                        if (-not $assocIndex.ContainsKey($key)) {
+                            $assocIndex[$key] = New-Object System.Collections.Generic.List[object]
+                        }
+                        $assocIndex[$key].Add([pscustomobject]@{
+                            DcrName         = $dcr.name
+                            DcrId           = $dcr.id
+                            SentinelEnabled = $sentinelEnabled
+                        }) | Out-Null
+
                         # Resource type = segments [-2..-1] above the resource name
                         $segs = $targetId -split '/'
                         if ($segs.Length -ge 8) {
@@ -382,11 +405,80 @@ foreach ($sub in $subscriptions) {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Export
+# 3. Enumerate VM-like resources and cross-reference with DCR associations
 # ---------------------------------------------------------------------------
-Write-Host "`n[3/3] Writing CSV: $OutputPath" -ForegroundColor Yellow
+Write-Host "`n[3/4] Enumerating VMs / VMSS / Arc machines and checking DCR coverage..." -ForegroundColor Yellow
+
+$vmTypes = @(
+    'Microsoft.Compute/virtualMachines',
+    'Microsoft.Compute/virtualMachineScaleSets',
+    'Microsoft.HybridCompute/machines'
+)
+
+foreach ($sub in $subscriptions) {
+    try {
+        Set-AzContext -SubscriptionId $sub.Id -Tenant $ctx.Tenant.Id -ErrorAction Stop | Out-Null
+    } catch { continue }
+
+    $vms = @()
+    foreach ($t in $vmTypes) {
+        $vms += Get-AzResource -ResourceType $t -ErrorAction SilentlyContinue
+    }
+    if (-not $vms) { continue }
+
+    Write-Host ("  {0,-40} {1,4} VM-like resource(s)" -f $sub.Name, $vms.Count) -ForegroundColor Cyan
+
+    foreach ($vm in $vms) {
+        $key      = $vm.ResourceId.ToLower()
+        $entries  = @()
+        if ($assocIndex.ContainsKey($key)) {
+            # Materialise the List[object] into a plain array — some pwsh builds
+            # choke on @() over a generic list returned by a hashtable indexer.
+            $entries = @($assocIndex[$key].ToArray())
+        }
+        $dcrCount = $entries.Count
+        $hasDcr   = $dcrCount -gt 0
+        $hasSent  = $false
+        $dcrNames = ''
+        if ($dcrCount -gt 0) {
+            $hasSent  = (@($entries | Where-Object { $_.SentinelEnabled })).Count -gt 0
+            $dcrNames = (@($entries | Select-Object -ExpandProperty DcrName -Unique)) -join '; '
+        }
+
+        # Best-effort OS hint (only present for ARM VMs when expanded; skip the extra call
+        # to keep things fast — most operators care about the association status).
+        $osType = ''
+        if ($vm.Kind)                  { $osType = $vm.Kind }
+        elseif ($vm.Properties -and $vm.Properties.osType) { $osType = $vm.Properties.osType }
+
+        $vmResults.Add([pscustomobject]@{
+            VmName               = $vm.Name
+            VmType               = $vm.ResourceType
+            ResourceId           = $vm.ResourceId
+            Location             = $vm.Location
+            ResourceGroup        = $vm.ResourceGroupName
+            SubscriptionName     = $sub.Name
+            SubscriptionId       = $sub.Id
+            OsHint               = $osType
+            HasDcrAssociation    = $hasDcr
+            AssociatedDcrCount   = $dcrCount
+            SendingToSentinel    = $hasSent
+            AssociatedDcrNames   = $dcrNames
+        }) | Out-Null
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 4. Export
+# ---------------------------------------------------------------------------
+Write-Host "`n[4/4] Writing CSVs..." -ForegroundColor Yellow
+Write-Host "  DCR CSV : $OutputPath"
 $results | Sort-Object SentinelEnabled, SubscriptionName, DcrName -Descending |
            Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host "  VM CSV  : $VmOutputPath"
+$vmResults | Sort-Object HasDcrAssociation, SubscriptionName, VmName |
+             Export-Csv -Path $VmOutputPath -NoTypeInformation -Encoding UTF8
 
 # ---------------------------------------------------------------------------
 # Console summary
@@ -397,13 +489,21 @@ $nonSentinel     = ($results | Where-Object { -not $_.SentinelEnabled }).Count
 $totalAssocs     = ($results | Measure-Object -Property AssociationCount -Sum).Sum
 $collectingSec   = ($results | Where-Object CollectsWindowsSecurityLog).Count
 
+$totalVms        = $vmResults.Count
+$vmsNoDcr        = ($vmResults | Where-Object { -not $_.HasDcrAssociation }).Count
+$vmsNoSentinel   = ($vmResults | Where-Object { -not $_.SendingToSentinel }).Count
+
 Write-Host "`nDone." -ForegroundColor Green
 Write-Host "  DCRs inventoried                     : $total"
 Write-Host "  DCRs targeting a Sentinel workspace  : $toSentinel"
 Write-Host "  DCRs NOT targeting Sentinel          : $nonSentinel"
 Write-Host "  DCRs collecting Windows Security log : $collectingSec"
 Write-Host "  Total resource associations          : $totalAssocs"
-Write-Host "  CSV saved to                         : $OutputPath"
+Write-Host "  VM-like resources discovered         : $totalVms"
+Write-Host "  VMs with NO DCR association          : $vmsNoDcr"
+Write-Host "  VMs not sending to any Sentinel WS   : $vmsNoSentinel"
+Write-Host "  DCR CSV                              : $OutputPath"
+Write-Host "  VM  CSV                              : $VmOutputPath"
 
 if ($sentinelWorkspaces.Count -gt 1) {
     Write-Host "`n  Breakdown by Sentinel workspace:" -ForegroundColor Cyan

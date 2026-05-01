@@ -19,7 +19,7 @@
     Project : Sentinel Lookout
     Author  : Predrag (Peter) Petrovic <ppetrovic@microsoft.com>
     License : MIT
-    Repo    : https://github.com/0xrick-dev/sentinel-lookout
+    Repo    : https://github.com/0xrick-dev/Sentinel_Lookout
  
     Run from Azure Cloud Shell (PowerShell). Requires Az modules (preinstalled in Cloud Shell)
     and Microsoft.Graph.Identity.DirectoryManagement for Entra ID diagnostic settings.

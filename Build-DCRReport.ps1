@@ -22,7 +22,7 @@
     Project : Sentinel Lookout
     Author  : Predrag (Peter) Petrovic <ppetrovic@microsoft.com>
     License : MIT
-    Repo    : https://github.com/0xrick-dev/sentinel-lookout
+    Repo    : https://github.com/0xrick-dev/Sentinel_Lookout
 
     Run from Azure Cloud Shell (PowerShell). Requires Az modules (preinstalled in Cloud Shell).
 
@@ -55,6 +55,25 @@ if (-not $rows) {
     return
 }
 
+# Companion VM inventory CSV produced by Audit-SentinelDCRs.ps1.
+$vmCsvPath = [System.IO.Path]::Combine(
+    [System.IO.Path]::GetDirectoryName($InputCsv),
+    [System.IO.Path]::GetFileNameWithoutExtension($InputCsv) + '_VMs.csv'
+)
+$vmRows = @()
+if (Test-Path $vmCsvPath) {
+    $vmRows = @(Import-Csv -Path $vmCsvPath)
+    foreach ($v in $vmRows) {
+        $v.HasDcrAssociation = ($v.HasDcrAssociation -eq 'True')
+        $v.SendingToSentinel = ($v.SendingToSentinel -eq 'True')
+        $n = 0; [int]::TryParse([string]$v.AssociatedDcrCount, [ref]$n) | Out-Null
+        $v.AssociatedDcrCount = $n
+    }
+    Write-Host "Loaded VM inventory: $($vmRows.Count) machine(s) from $vmCsvPath" -ForegroundColor Cyan
+} else {
+    Write-Warning "VM inventory CSV not found alongside DCR CSV ($vmCsvPath). 'Unassociated VMs' tab will be empty."
+}
+
 # Normalise booleans from CSV strings.
 $boolCols = @(
     'SentinelEnabled','HasNonSentinelDestination',
@@ -84,6 +103,11 @@ $notSendingRows    = @($rows | Where-Object { -not $_.SentinelEnabled })
 $totalAssocs        = ($rows | Measure-Object -Property AssociationCount -Sum).Sum
 $assocsToSentinel   = ($sendingRows    | Measure-Object -Property AssociationCount -Sum).Sum
 $assocsNotSentinel  = ($notSendingRows | Measure-Object -Property AssociationCount -Sum).Sum
+
+# VM coverage gap: machines with no DCR association at all
+$unassocVms      = @($vmRows | Where-Object { -not $_.HasDcrAssociation })
+$vmsNoSentinel   = @($vmRows | Where-Object { -not $_.SendingToSentinel })
+$totalVms        = $vmRows.Count
 
 # Per-Sentinel-workspace breakdown (workspaces are semicolon-joined inside the column)
 $wsBreakdown = $sendingRows |
@@ -115,6 +139,10 @@ if ($sendingRows.Count    -eq 1) { $sendingJson    = "[$sendingJson]" }
 if ($notSendingRows.Count -eq 1) { $notSendingJson = "[$notSendingJson]" }
 if ($sendingRows.Count    -eq 0) { $sendingJson    = '[]' }
 if ($notSendingRows.Count -eq 0) { $notSendingJson = '[]' }
+
+$unassocJson = $unassocVms | ConvertTo-Json -Depth 3 -Compress
+if ($unassocVms.Count -eq 1) { $unassocJson = "[$unassocJson]" }
+if ($unassocVms.Count -eq 0) { $unassocJson = '[]' }
 
 $workspaceRowsHtml = if ($wsBreakdown) {
     ($wsBreakdown | ForEach-Object {
@@ -268,7 +296,7 @@ $html = @"
   <div class="meta">
     <span class="pulse">live snapshot</span>
     <span class="ts">generated $generated</span>
-    <span class="ts">$totalRows DCRs · $totalAssocs associations · $($wsBreakdown.Count) Sentinel workspace(s)</span>
+    <span class="ts">$totalRows DCRs · $totalAssocs associations · $($wsBreakdown.Count) Sentinel workspace(s) · $totalVms VM-like resources</span>
   </div>
 </header>
 
@@ -294,6 +322,11 @@ $html = @"
       <div class="label">Sentinel WS</div>
       <div class="value">$($wsBreakdown.Count)</div>
       <div class="delta">workspaces with SecurityInsights solution attached</div>
+    </div>
+    <div class="kpi bad">
+      <div class="label">VMs without DCR</div>
+      <div class="value">$($unassocVms.Count)</div>
+      <div class="delta">of $totalVms total · zero data collection rules attached</div>
     </div>
   </div>
 
@@ -322,6 +355,9 @@ $coverageRowsHtml
     </button>
     <button class="tab" data-view="notsending">
       Not sending to Sentinel <span class="count" id="cnt-notsending">$($notSendingRows.Count)</span>
+    </button>
+    <button class="tab" data-view="unassoc">
+      Unassociated VMs <span class="count" id="cnt-unassoc">$($unassocVms.Count)</span>
     </button>
   </div>
 
@@ -372,6 +408,23 @@ $coverageRowsHtml
     </div>
   </section>
 
+  <section class="view" id="view-unassoc">
+    <div class="table-wrap">
+      <table class="data" id="tbl-unassoc">
+        <thead>
+          <tr>
+            <th>VM / Machine</th>
+            <th>Type</th>
+            <th>Location</th>
+            <th>Subscription / RG</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
   <footer>
     <span>DCR audit · $generated</span>
     <span>Source CSV · $([System.IO.Path]::GetFileName($InputCsv))</span>
@@ -381,6 +434,7 @@ $coverageRowsHtml
 <script>
   const SENDING     = $sendingJson;
   const NOT_SENDING = $notSendingJson;
+  const UNASSOC     = $unassocJson;
 
   function escapeHtml(s){
     if (s === null || s === undefined) return '';
@@ -489,6 +543,18 @@ $coverageRowsHtml
       + '</tr>';
   }
 
+  function renderVmRow(v){
+    return '<tr class="not-sending">'
+      + '<td><div class="resname">' + escapeHtml(v.VmName) + '</div>'
+      +   '<div class="sub">' + escapeHtml(v.OsHint || '') + '</div></td>'
+      + '<td><span class="restype">' + escapeHtml(v.VmType) + '</span></td>'
+      + '<td><span class="sub">' + escapeHtml(v.Location || '') + '</span></td>'
+      + '<td><div>' + escapeHtml(v.SubscriptionName) + '</div>'
+      +   '<div class="sub">' + escapeHtml(v.ResourceGroup) + '</div></td>'
+      + '<td><span class="badge no">no DCR</span></td>'
+      + '</tr>';
+  }
+
   function rowMatches(r, q){
     if (!q) return true;
     const hay = [
@@ -501,13 +567,24 @@ $coverageRowsHtml
     return hay.indexOf(q) !== -1;
   }
 
+  function vmMatches(v, q){
+    if (!q) return true;
+    const hay = [
+      v.VmName, v.VmType, v.ResourceId, v.Location, v.OsHint,
+      v.SubscriptionName, v.ResourceGroup
+    ].map(x => (x||'').toString().toLowerCase()).join(' | ');
+    return hay.indexOf(q) !== -1;
+  }
+
   function paint(){
     const q = document.getElementById('filter').value.trim().toLowerCase();
     const sBody = document.querySelector('#tbl-sending tbody');
     const nBody = document.querySelector('#tbl-notsending tbody');
+    const uBody = document.querySelector('#tbl-unassoc tbody');
 
     const sFilt = SENDING.filter(r => rowMatches(r, q));
     const nFilt = NOT_SENDING.filter(r => rowMatches(r, q));
+    const uFilt = UNASSOC.filter(v => vmMatches(v, q));
 
     sBody.innerHTML = sFilt.length
       ? sFilt.map(r => renderRow(r, true)).join('')
@@ -515,9 +592,13 @@ $coverageRowsHtml
     nBody.innerHTML = nFilt.length
       ? nFilt.map(r => renderRow(r, false)).join('')
       : '<tr><td colspan="7" class="empty-state">Nothing matches — every DCR in this filter is feeding Sentinel.</td></tr>';
+    uBody.innerHTML = uFilt.length
+      ? uFilt.map(renderVmRow).join('')
+      : '<tr><td colspan="5" class="empty-state">Every VM-like resource in scope has at least one DCR association.</td></tr>';
 
     document.getElementById('cnt-sending').textContent    = sFilt.length;
     document.getElementById('cnt-notsending').textContent = nFilt.length;
+    document.getElementById('cnt-unassoc').textContent    = uFilt.length;
   }
 
   document.querySelectorAll('.tab').forEach(btn => {
@@ -534,16 +615,25 @@ $coverageRowsHtml
   document.getElementById('btn-export').addEventListener('click', () => {
     const q = document.getElementById('filter').value.trim().toLowerCase();
     const activeView = document.querySelector('.tab.active').dataset.view;
-    const data = (activeView === 'sending' ? SENDING : NOT_SENDING).filter(r => rowMatches(r, q));
+
+    let data, cols;
+    if (activeView === 'unassoc') {
+      data = UNASSOC.filter(v => vmMatches(v, q));
+      cols = ['VmName','VmType','ResourceId','Location','OsHint','ResourceGroup',
+              'SubscriptionName','SubscriptionId','HasDcrAssociation',
+              'AssociatedDcrCount','SendingToSentinel','AssociatedDcrNames'];
+    } else {
+      data = (activeView === 'sending' ? SENDING : NOT_SENDING).filter(r => rowMatches(r, q));
+      cols = ['DcrName','DcrResourceId','Kind','Location','ResourceGroup','SubscriptionName',
+              'DestinationWorkspaces','DestinationWorkspaceResourceIds','SentinelEnabled',
+              'SentinelWorkspaces','HasNonSentinelDestination','OtherDestinations',
+              'DataCollectionSummary','Streams',
+              'CollectsWindowsEventLogs','CollectsWindowsSecurityLog','CollectsSyslog',
+              'CollectsPerformanceCounters','CollectsCustomLogFiles','CollectsIISLogs',
+              'CollectsExtensions','CollectsPrometheus','CollectsWindowsFirewallLogs',
+              'AssociationCount','AssociatedResourceTypes','AssociatedResourceIds'];
+    }
     if (!data.length){ alert('Nothing to export.'); return; }
-    const cols = ['DcrName','DcrResourceId','Kind','Location','ResourceGroup','SubscriptionName',
-                  'DestinationWorkspaces','DestinationWorkspaceResourceIds','SentinelEnabled',
-                  'SentinelWorkspaces','HasNonSentinelDestination','OtherDestinations',
-                  'DataCollectionSummary','Streams',
-                  'CollectsWindowsEventLogs','CollectsWindowsSecurityLog','CollectsSyslog',
-                  'CollectsPerformanceCounters','CollectsCustomLogFiles','CollectsIISLogs',
-                  'CollectsExtensions','CollectsPrometheus','CollectsWindowsFirewallLogs',
-                  'AssociationCount','AssociatedResourceTypes','AssociatedResourceIds'];
     const esc = v => {
       if (v === null || v === undefined) return '';
       const s = String(v);
@@ -571,4 +661,5 @@ Write-Host "`nReport written: $OutputHtml" -ForegroundColor Green
 Write-Host "  DCRs sending to Sentinel    : $($sendingRows.Count) ($assocsToSentinel associations)"
 Write-Host "  DCRs NOT sending to Sentinel: $($notSendingRows.Count) ($assocsNotSentinel associations)"
 Write-Host "  Sentinel workspaces         : $($wsBreakdown.Count)"
+Write-Host "  VMs without any DCR         : $($unassocVms.Count) of $totalVms"
 Write-Host "`nIn Cloud Shell, download with: download $OutputHtml" -ForegroundColor Cyan
