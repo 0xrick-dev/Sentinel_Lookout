@@ -2,6 +2,7 @@
 .SYNOPSIS
     Audits every Data Collection Rule (DCR) in the tenant, the resources associated
     with each rule, and whether the destination Log Analytics Workspace is Sentinel-enabled.
+    Supports parallel workers and resume-on-rerun for large tenants.
 
 .DESCRIPTION
     - Discovers all Log Analytics Workspaces with Sentinel (SecurityInsights) enabled.
@@ -17,6 +18,49 @@
           via the data collection rule associations API.
     - Exports a CSV with one row per DCR.
 
+    Tracking & resume:
+        Per-subscription progress is written to a sidecar state directory next to
+        -OutputPath (default '<OutputPath>.state'). Each DCR row is appended to
+        a per-subscription partial CSV immediately after it is fetched, so an
+        interrupted run loses at most the in-flight subscription. On rerun the
+        script reattaches to the existing state directory and skips subscriptions
+        whose .done marker is present.
+
+    Parallelism:
+        On PowerShell 7+ subscriptions are processed concurrently with
+        ForEach-Object -Parallel (default 4 workers, configurable via
+        -ThrottleLimit). The constant ARM traffic also helps prevent Azure
+        Cloud Shell's 20-minute idle timeout from killing the session.
+
+.PARAMETER OutputPath
+    Final CSV path. A companion CSV with VM-association data is written next to it.
+
+.PARAMETER ThrottleLimit
+    Maximum number of subscriptions to process in parallel. Default 4.
+
+.PARAMETER StatePath
+    Override the state directory location. Default: '<OutputPath>.state'.
+
+.PARAMETER Force
+    Allow resuming a state directory whose recorded tenantId differs from the
+    current Az context. Use with care.
+
+.PARAMETER CleanState
+    Delete the state directory after a successful run. Errors.jsonl is preserved
+    as '<OutputPath>.errors.jsonl' if any non-fatal errors were recorded.
+
+.EXAMPLE
+    ./Audit-SentinelDCRs.ps1
+        Run with defaults; resumes automatically if the state directory exists.
+
+.EXAMPLE
+    ./Audit-SentinelDCRs.ps1 -ThrottleLimit 8 -OutputPath ./dcr.csv
+        Use 8 parallel workers and a custom output path.
+
+.EXAMPLE
+    ./Audit-SentinelDCRs.ps1 -OutputPath ./dcr.csv -CleanState
+        Delete the state directory on successful completion.
+
 .NOTES
     Project : Sentinel Lookout
     Author  : Predrag (Peter) Petrovic <ppetrovic@microsoft.com>
@@ -25,6 +69,7 @@
 
     Run from Azure Cloud Shell (PowerShell). Requires Az modules (preinstalled in Cloud Shell).
     Reader on each subscription is sufficient. No Microsoft Graph calls are made.
+    PowerShell 7+ is required for parallel execution; PS5.1 is not supported.
 
     DISCLAIMER: This is an open-source project. It is not produced, endorsed, or
     supported by Microsoft Corporation. Use at your own risk.
@@ -32,12 +77,21 @@
 
 [CmdletBinding()]
 param(
-    [string]$OutputPath = "$HOME/SentinelDCRAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    [string] $OutputPath    = "$HOME/SentinelDCRAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+    [int]    $ThrottleLimit = 4,
+    [string] $StatePath,
+    [switch] $Force,
+    [switch] $CleanState
 )
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
 $env:SuppressAzurePowerShellBreakingChangeWarnings = 'true'
+
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Error "PowerShell 7+ is required (parallel workers use ForEach-Object -Parallel). Detected: $($PSVersionTable.PSVersion). Run inside Cloud Shell PowerShell or install pwsh."
+    return
+}
 
 # DCR + DCRA stable GA API version.
 $DcrApiVersion  = '2022-06-01'
@@ -49,9 +103,9 @@ $VmOutputPath = [System.IO.Path]::Combine(
     [System.IO.Path]::GetFileNameWithoutExtension($OutputPath) + '_VMs.csv'
 )
 
-$vmResults    = New-Object System.Collections.Generic.List[object]
-# Map: lowercased resourceId -> list of DCR rows that associate it
-$assocIndex   = @{}
+if (-not $StatePath) { $StatePath = $OutputPath + '.state' }
+
+. "$PSScriptRoot/_AuditState.ps1"
 
 # ---------------------------------------------------------------------------
 # 0. Sanity check
@@ -61,50 +115,21 @@ if (-not $ctx) {
     Write-Host "Not signed in. Run Connect-AzAccount first." -ForegroundColor Red
     return
 }
-Write-Host "Signed in as: $($ctx.Account.Id)" -ForegroundColor Cyan
-Write-Host "Tenant      : $($ctx.Tenant.Id)" -ForegroundColor Cyan
+Write-Host "Signed in as : $($ctx.Account.Id)" -ForegroundColor Cyan
+Write-Host "Tenant       : $($ctx.Tenant.Id)" -ForegroundColor Cyan
+Write-Host "State dir    : $StatePath"        -ForegroundColor Cyan
+Write-Host "Output CSV   : $OutputPath"       -ForegroundColor Cyan
+Write-Host "VM CSV       : $VmOutputPath"     -ForegroundColor Cyan
+Write-Host "Throttle     : $ThrottleLimit"    -ForegroundColor Cyan
 
-$results = New-Object System.Collections.Generic.List[object]
+$null = Initialize-AuditState -StatePath $StatePath -TenantId $ctx.Tenant.Id `
+                              -OutputPath $OutputPath -Kind 'DCR' -Force:$Force
 
-# ---------------------------------------------------------------------------
-# 1. Discover Sentinel-enabled Log Analytics Workspaces
-# ---------------------------------------------------------------------------
-Write-Host "`n[1/3] Locating Sentinel-enabled Log Analytics Workspaces..." -ForegroundColor Yellow
-
-$sentinelWorkspaces = @{}   # key = workspace ResourceId (lowercase), value = workspace name
-$subscriptions      = Get-AzSubscription -TenantId $ctx.Tenant.Id |
-                      Where-Object { $_.State -eq 'Enabled' }
-
-foreach ($sub in $subscriptions) {
-    try {
-        Set-AzContext -SubscriptionId $sub.Id -Tenant $ctx.Tenant.Id -ErrorAction Stop | Out-Null
-    } catch {
-        Write-Warning "Cannot switch to subscription $($sub.Name): $_"
-        continue
-    }
-
-    $solutions = Get-AzResource -ResourceType 'Microsoft.OperationsManagement/solutions' `
-                                -ErrorAction SilentlyContinue |
-                 Where-Object { $_.Name -like 'SecurityInsights*' }
-
-    foreach ($sol in $solutions) {
-        $full = Get-AzResource -ResourceId $sol.ResourceId -ExpandProperties -ErrorAction SilentlyContinue
-        $wsId = $full.Properties.workspaceResourceId
-        if ($wsId) {
-            $sentinelWorkspaces[$wsId.ToLower()] = ($wsId -split '/')[-1]
-            Write-Host "  Sentinel workspace: $wsId" -ForegroundColor Green
-        }
-    }
-}
-
-if ($sentinelWorkspaces.Count -eq 0) {
-    Write-Warning "No Sentinel-enabled workspaces found. SentinelEnabled will be False for all rows."
-} else {
-    Write-Host "  Total Sentinel-enabled workspaces discovered: $($sentinelWorkspaces.Count)" -ForegroundColor Green
-}
+$subscriptions = Get-AzSubscription -TenantId $ctx.Tenant.Id |
+                 Where-Object { $_.State -eq 'Enabled' }
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (per-DCR data shaping). Re-imported into each parallel runspace.
 # ---------------------------------------------------------------------------
 function Get-DcrDataCollectionSummary {
     param($Properties)
@@ -116,7 +141,6 @@ function Get-DcrDataCollectionSummary {
         return ,$summary
     }
 
-    # Windows Event Logs (xPathQueries reveal whether Security log is collected)
     if ($ds.windowsEventLogs) {
         foreach ($w in $ds.windowsEventLogs) {
             $xpaths = @($w.xPathQueries) -join ', '
@@ -128,8 +152,6 @@ function Get-DcrDataCollectionSummary {
             $summary.Add("$tag [$xpaths]")
         }
     }
-
-    # Syslog
     if ($ds.syslog) {
         foreach ($s in $ds.syslog) {
             $facs = @($s.facilityNames) -join ','
@@ -137,8 +159,6 @@ function Get-DcrDataCollectionSummary {
             $summary.Add("Syslog facilities=[$facs] levels=[$lvls]")
         }
     }
-
-    # Performance counters
     if ($ds.performanceCounters) {
         foreach ($p in $ds.performanceCounters) {
             $cnt  = (@($p.counterSpecifiers)).Count
@@ -146,8 +166,6 @@ function Get-DcrDataCollectionSummary {
             $summary.Add("PerfCounters x$cnt @${freq}s")
         }
     }
-
-    # Custom log files
     if ($ds.logFiles) {
         foreach ($l in $ds.logFiles) {
             $patterns = @($l.filePatterns) -join ', '
@@ -155,41 +173,19 @@ function Get-DcrDataCollectionSummary {
             $summary.Add("LogFiles($fmt) [$patterns]")
         }
     }
-
-    # IIS logs
     if ($ds.iisLogs) {
         foreach ($i in $ds.iisLogs) {
             $dirs = @($i.logDirectories) -join ', '
             $summary.Add("IISLogs [$dirs]")
         }
     }
-
-    # Extensions (e.g. AzureSecurityWindowsAgent / Defender for Servers, DependencyAgent...)
     if ($ds.extensions) {
-        foreach ($e in $ds.extensions) {
-            $summary.Add("Extension:$($e.extensionName)")
-        }
+        foreach ($e in $ds.extensions) { $summary.Add("Extension:$($e.extensionName)") }
     }
-
-    # Prometheus forwarder (AKS)
-    if ($ds.prometheusForwarder) {
-        $summary.Add("PrometheusForwarder x$((@($ds.prometheusForwarder)).Count)")
-    }
-
-    # Windows Firewall logs
-    if ($ds.windowsFirewallLogs) {
-        $summary.Add("WindowsFirewallLogs")
-    }
-
-    # Platform telemetry
-    if ($ds.platformTelemetry) {
-        $summary.Add("PlatformTelemetry")
-    }
-
-    # Data Imports (e.g. Event Hub stream ingest)
-    if ($Properties.dataSources.dataImports) {
-        $summary.Add("DataImports")
-    }
+    if ($ds.prometheusForwarder) { $summary.Add("PrometheusForwarder x$((@($ds.prometheusForwarder)).Count)") }
+    if ($ds.windowsFirewallLogs) { $summary.Add("WindowsFirewallLogs") }
+    if ($ds.platformTelemetry)   { $summary.Add("PlatformTelemetry") }
+    if ($Properties.dataSources.dataImports) { $summary.Add("DataImports") }
 
     if ($summary.Count -eq 0) { $summary.Add('(no data sources)') }
     return ,$summary
@@ -231,29 +227,108 @@ function Get-DcrCollectionFlags {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Enumerate every DCR per subscription, plus its associations
+# 1. Discover Sentinel-enabled Log Analytics Workspaces (refreshed every run)
 # ---------------------------------------------------------------------------
-Write-Host "`n[2/3] Enumerating Data Collection Rules and associations..." -ForegroundColor Yellow
+Write-Host "`n[1/4] Locating Sentinel-enabled Log Analytics Workspaces..." -ForegroundColor Yellow
 
-foreach ($sub in $subscriptions) {
-    try {
-        Set-AzContext -SubscriptionId $sub.Id -Tenant $ctx.Tenant.Id -ErrorAction Stop | Out-Null
-    } catch { continue }
+$workspacesCachePath = Join-Path $StatePath 'workspaces.json'
+$sentinelWorkspaces  = @{}
 
-    Write-Host "`n  Subscription: $($sub.Name)" -ForegroundColor Cyan
+# Always refresh: workspaces are cheap to list and stale data leads to wrong SentinelEnabled.
+$tenantId = $ctx.Tenant.Id
+$wsHits   = $subscriptions | ForEach-Object -Parallel {
+    $sub = $_
+    $tid = $using:tenantId
+    try { Set-AzContext -SubscriptionId $sub.Id -Tenant $tid -ErrorAction Stop | Out-Null }
+    catch { return }
 
-    # List DCRs in the subscription via REST (one shot, paginated).
+    $solutions = Get-AzResource -ResourceType 'Microsoft.OperationsManagement/solutions' `
+                                -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -like 'SecurityInsights*' }
+
+    foreach ($sol in $solutions) {
+        $full = Get-AzResource -ResourceId $sol.ResourceId -ExpandProperties -ErrorAction SilentlyContinue
+        $wsId = $full.Properties.workspaceResourceId
+        if ($wsId) {
+            [pscustomobject]@{ id = $wsId; name = ($wsId -split '/')[-1] }
+        }
+    }
+} -ThrottleLimit $ThrottleLimit
+
+foreach ($w in $wsHits) {
+    $sentinelWorkspaces[$w.id.ToLower()] = $w.name
+    Write-Host "  Sentinel workspace: $($w.id)" -ForegroundColor Green
+}
+$sentinelWorkspaces | ConvertTo-Json | Set-Content -Path $workspacesCachePath -Encoding UTF8
+
+if ($sentinelWorkspaces.Count -eq 0) {
+    Write-Warning "No Sentinel-enabled workspaces found. SentinelEnabled will be False for all rows."
+} else {
+    Write-Host "  Total Sentinel-enabled workspaces discovered: $($sentinelWorkspaces.Count)" -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------------------
+# 2. Enumerate every DCR per subscription (parallel, resumable)
+# ---------------------------------------------------------------------------
+Write-Host "`n[2/4] Enumerating Data Collection Rules and associations..." -ForegroundColor Yellow
+
+$fnDefs = Get-WorkerFunctionDefinitions -Extra @('Get-DcrDataCollectionSummary', 'Get-DcrCollectionFlags')
+$partialsDir = Join-Path $StatePath 'partials'
+
+$totalSubs = $subscriptions.Count
+$counter   = [hashtable]::Synchronized(@{ done = 0 })
+
+$subscriptions | ForEach-Object -Parallel {
+    $sub        = $_
+    $sp         = $using:StatePath
+    $partials   = $using:partialsDir
+    $tid        = $using:tenantId
+    $apiVer     = $using:DcrApiVersion
+    $apiVerA    = $using:DcraApiVersion
+    $wsMap      = $using:sentinelWorkspaces
+    $defs       = $using:fnDefs
+    $ctr        = $using:counter
+    $totSubs    = $using:totalSubs
+
+    # Reconstitute helper functions in this runspace.
+    foreach ($n in $defs.Keys) { Set-Item -Path "function:$n" -Value $defs[$n] }
+
+    $dcrCsv     = Join-Path $partials "dcrs.$($sub.Id).csv"
+    $assocFile  = Join-Path $partials "assoc.$($sub.Id).jsonl"
+    $doneMarker = "dcr-$($sub.Id)"
+
+    if (Test-SubscriptionDone -StatePath $sp -SubscriptionId $doneMarker) {
+        $ctr.done++
+        Write-Host ("  [{0,3}/{1}] {2,-40} (cached)" -f $ctr.done, $totSubs, $sub.Name) -ForegroundColor DarkGray
+        return
+    }
+
+    # Fresh attempt: clear any partial leftovers from a previous interrupted run.
+    if (Test-Path $dcrCsv)    { Remove-Item -Force $dcrCsv }
+    if (Test-Path $assocFile) { Remove-Item -Force $assocFile }
+
+    try { Set-AzContext -SubscriptionId $sub.Id -Tenant $tid -ErrorAction Stop | Out-Null }
+    catch {
+        Write-AuditError -StatePath $sp -SubscriptionId $sub.Id -Phase 'set-context' -Message $_.Exception.Message
+        $ctr.done++
+        return
+    }
+
+    # List DCRs (paginated REST call) with retry.
     $dcrs    = New-Object System.Collections.Generic.List[object]
-    $nextUri = "https://management.azure.com/subscriptions/$($sub.Id)/providers/Microsoft.Insights/dataCollectionRules?api-version=$DcrApiVersion"
+    $nextUri = "https://management.azure.com/subscriptions/$($sub.Id)/providers/Microsoft.Insights/dataCollectionRules?api-version=$apiVer"
     while ($nextUri) {
-        try {
-            $resp = Invoke-AzRestMethod -Method GET -Uri $nextUri -ErrorAction Stop
-        } catch {
-            Write-Warning "    DCR list call failed: $_"
+        try { $resp = Invoke-ArmRequest -Uri $nextUri }
+        catch {
+            Write-AuditError -StatePath $sp -SubscriptionId $sub.Id -Phase 'dcr-list' -Message $_.Exception.Message
+            $resp = $null
             break
         }
-        if ($resp.StatusCode -ne 200) {
-            Write-Warning "    DCR list HTTP $($resp.StatusCode): $($resp.Content)"
+        if (-not $resp -or $resp.StatusCode -ne 200) {
+            if ($resp) {
+                Write-AuditError -StatePath $sp -SubscriptionId $sub.Id -Phase 'dcr-list' `
+                                 -Message "HTTP $($resp.StatusCode): $($resp.Content)"
+            }
             break
         }
         $page = $resp.Content | ConvertFrom-Json
@@ -261,12 +336,10 @@ foreach ($sub in $subscriptions) {
         $nextUri = $page.nextLink
     }
 
-    Write-Host "    $($dcrs.Count) DCR(s) to inspect..."
-
+    $totalAssocs = 0
     foreach ($dcr in $dcrs) {
         $props = $dcr.properties
 
-        # --- Destinations / workspaces ---
         $laDestinations = @()
         if ($props.destinations -and $props.destinations.logAnalytics) {
             $laDestinations = @($props.destinations.logAnalytics)
@@ -276,23 +349,19 @@ foreach ($sub in $subscriptions) {
         $wsResourceIds  = @()
         $sentinelHits   = @()
         $hasNonSentinel = $false
-
         foreach ($d in $laDestinations) {
             $wsId = $d.workspaceResourceId
             if (-not $wsId) { continue }
             $wsResourceIds += $wsId
-            $wsName = ($wsId -split '/')[-1]
-            $wsNames += $wsName
-            if ($sentinelWorkspaces.ContainsKey($wsId.ToLower())) {
-                $sentinelHits += $sentinelWorkspaces[$wsId.ToLower()]
+            $wsNames       += ($wsId -split '/')[-1]
+            if ($wsMap.ContainsKey($wsId.ToLower())) {
+                $sentinelHits += $wsMap[$wsId.ToLower()]
             } else {
                 $hasNonSentinel = $true
             }
         }
-
         $sentinelEnabled = ($sentinelHits.Count -gt 0)
 
-        # Other destinations (less common but possible)
         $otherDestinations = @()
         if ($props.destinations.azureMonitorMetrics) { $otherDestinations += 'AzureMonitorMetrics' }
         if ($props.destinations.eventHubs)           { $otherDestinations += 'EventHubs'           }
@@ -302,50 +371,41 @@ foreach ($sub in $subscriptions) {
         if ($props.destinations.storageTablesDirect) { $otherDestinations += 'StorageTablesDirect' }
         if ($props.destinations.monitoringAccounts)  { $otherDestinations += 'MonitoringAccounts'  }
 
-        # --- Data sources / streams ---
-        $dataSummary = Get-DcrDataCollectionSummary -Properties $props
+        $dataSummary     = Get-DcrDataCollectionSummary -Properties $props
         $dataFlowStreams = @()
         if ($props.dataFlows) {
-            foreach ($df in $props.dataFlows) {
-                $dataFlowStreams += @($df.streams)
-            }
+            foreach ($df in $props.dataFlows) { $dataFlowStreams += @($df.streams) }
         }
         $dataFlowStreams = $dataFlowStreams | Select-Object -Unique
         $flags = Get-DcrCollectionFlags -Properties $props
 
-        # --- Associations (which VMs / Arc / VMSS reference this rule) ---
+        # Associations
         $assocResourceIds   = @()
         $assocResourceTypes = @()
         $assocCount         = 0
         try {
-            $assocUri  = "https://management.azure.com$($dcr.id)/associations?api-version=$DcraApiVersion"
-            $assocResp = Invoke-AzRestMethod -Method GET -Uri $assocUri -ErrorAction Stop
+            $assocUri  = "https://management.azure.com$($dcr.id)/associations?api-version=$apiVerA"
+            $assocResp = Invoke-ArmRequest -Uri $assocUri
             if ($assocResp.StatusCode -eq 200) {
                 $assocPayload = $assocResp.Content | ConvertFrom-Json
                 foreach ($a in @($assocPayload.value)) {
-                    # Association id form:
-                    #   {targetResourceId}/providers/Microsoft.Insights/dataCollectionRuleAssociations/{name}
                     $idx = $a.id.ToLower().IndexOf('/providers/microsoft.insights/datacollectionruleassociations/')
                     if ($idx -gt 0) {
                         $targetId = $a.id.Substring(0, $idx)
-                        $assocResourceIds   += $targetId
+                        $assocResourceIds += $targetId
 
-                        # Track which DCRs each target is associated with (used later
-                        # to find VMs that have no DCR association at all).
-                        $key = $targetId.ToLower()
-                        if (-not $assocIndex.ContainsKey($key)) {
-                            $assocIndex[$key] = New-Object System.Collections.Generic.List[object]
-                        }
-                        $assocIndex[$key].Add([pscustomobject]@{
-                            DcrName         = $dcr.name
-                            DcrId           = $dcr.id
-                            SentinelEnabled = $sentinelEnabled
-                        }) | Out-Null
+                        # Persist association so the VM-cross-reference phase can rebuild
+                        # the index without re-fetching DCRs.
+                        $assocLine = [pscustomobject]@{
+                            target          = $targetId
+                            dcrName         = $dcr.name
+                            dcrId           = $dcr.id
+                            sentinelEnabled = $sentinelEnabled
+                        } | ConvertTo-Json -Compress
+                        Add-Content -Path $assocFile -Value $assocLine -Encoding UTF8
 
-                        # Resource type = segments [-2..-1] above the resource name
                         $segs = $targetId -split '/'
                         if ($segs.Length -ge 8) {
-                            # /subscriptions/<id>/resourceGroups/<rg>/providers/<ns>/<type>[/<sub>/<subType>]/<name>
                             $providerNs = $segs[6]
                             $typeChain  = ($segs[7..($segs.Length - 2)] | Where-Object { $_ }) -join '/'
                             $assocResourceTypes += "$providerNs/$typeChain"
@@ -354,14 +414,16 @@ foreach ($sub in $subscriptions) {
                     $assocCount++
                 }
             } elseif ($assocResp.StatusCode -ne 404) {
-                Write-Warning "    Associations HTTP $($assocResp.StatusCode) for $($dcr.name)"
+                Write-AuditError -StatePath $sp -SubscriptionId $sub.Id -Phase 'dcr-assoc' `
+                                 -Target $dcr.name -Message "HTTP $($assocResp.StatusCode)"
             }
         } catch {
-            Write-Warning "    Failed to enumerate associations for $($dcr.name): $_"
+            Write-AuditError -StatePath $sp -SubscriptionId $sub.Id -Phase 'dcr-assoc' `
+                             -Target $dcr.name -Message $_.Exception.Message
         }
+        $totalAssocs += $assocCount
         $assocResourceTypes = $assocResourceTypes | Select-Object -Unique
 
-        # --- Resource group from id ---
         $rg = ''
         $m  = [regex]::Match($dcr.id, '/resourceGroups/([^/]+)/', 'IgnoreCase')
         if ($m.Success) { $rg = $m.Groups[1].Value }
@@ -395,19 +457,50 @@ foreach ($sub in $subscriptions) {
             AssociatedResourceTypes          = ($assocResourceTypes) -join '; '
             AssociatedResourceIds            = ($assocResourceIds   | Select-Object -Unique) -join '; '
         }
-        $results.Add($row) | Out-Null
 
-        $sentinelMark  = if ($sentinelEnabled) { '→ Sentinel' } else { 'NOT Sentinel' }
-        $sentinelColor = if ($sentinelEnabled) { 'Green' }      else { 'DarkYellow' }
-        Write-Host ("    {0,-50} assoc={1,-3} {2}" -f $dcr.name, $assocCount, $sentinelMark) `
-                   -ForegroundColor $sentinelColor
+        # Per-DCR durable append.
+        Add-CsvRow -Path $dcrCsv -Row $row
     }
-}
+
+    Set-SubscriptionDone -StatePath $sp -SubscriptionId $doneMarker `
+                         -Stats @{ dcrs = $dcrs.Count; assocs = $totalAssocs }
+
+    $ctr.done++
+    Write-Host ("  [{0,3}/{1}] {2,-40} dcrs={3,-4} assocs={4}" -f $ctr.done, $totSubs, $sub.Name, $dcrs.Count, $totalAssocs) -ForegroundColor Cyan
+} -ThrottleLimit $ThrottleLimit
 
 # ---------------------------------------------------------------------------
-# 3. Enumerate VM-like resources and cross-reference with DCR associations
+# 3. Rebuild assocIndex from disk and enumerate VMs (parallel, resumable)
 # ---------------------------------------------------------------------------
 Write-Host "`n[3/4] Enumerating VMs / VMSS / Arc machines and checking DCR coverage..." -ForegroundColor Yellow
+
+# Build with List[object] for fast appends, then FREEZE to plain object[] arrays.
+# This is critical: PS7 ForEach-Object -Parallel passes $using: variables through
+# a serialization boundary, and hashtables whose values are List[object] become
+# unindexable inside the runspace ($idx[$key] throws "Argument types do not
+# match"). Plain arrays survive the boundary correctly.
+$assocBuild = @{}
+Get-ChildItem -Path $partialsDir -Filter 'assoc.*.jsonl' -ErrorAction SilentlyContinue | ForEach-Object {
+    foreach ($line in (Get-Content -Path $_.FullName)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $entry = $line | ConvertFrom-Json
+        $key = $entry.target.ToLower()
+        if (-not $assocBuild.ContainsKey($key)) {
+            $assocBuild[$key] = New-Object System.Collections.Generic.List[object]
+        }
+        $assocBuild[$key].Add([pscustomobject]@{
+            DcrName         = $entry.dcrName
+            DcrId           = $entry.dcrId
+            SentinelEnabled = $entry.sentinelEnabled
+        }) | Out-Null
+    }
+}
+$assocIndex = @{}
+foreach ($k in $assocBuild.Keys) {
+    $assocIndex[$k] = $assocBuild[$k].ToArray()
+}
+$assocBuild = $null
+Write-Host "  Loaded $($assocIndex.Count) associated resource id(s) from partial state."
 
 $vmTypes = @(
     'Microsoft.Compute/virtualMachines',
@@ -415,27 +508,61 @@ $vmTypes = @(
     'Microsoft.HybridCompute/machines'
 )
 
-foreach ($sub in $subscriptions) {
-    try {
-        Set-AzContext -SubscriptionId $sub.Id -Tenant $ctx.Tenant.Id -ErrorAction Stop | Out-Null
-    } catch { continue }
+# Drop any stale vm-* .done markers from runs that pre-date the assoc-index fix,
+# so users don't have to manually nuke their state directory after upgrading.
+$staleMarkers = Get-ChildItem -Path (Join-Path $StatePath 'subscriptions') -Filter 'vm-*.done' -ErrorAction SilentlyContinue
+if ($staleMarkers) {
+    Write-Host "  Resetting $($staleMarkers.Count) VM .done marker(s) to recompute associations..." -ForegroundColor DarkYellow
+    $staleMarkers | Remove-Item -Force
+}
+
+$vmCounter = [hashtable]::Synchronized(@{ done = 0 })
+
+$subscriptions | ForEach-Object -Parallel {
+    $sub      = $_
+    $sp       = $using:StatePath
+    $partials = $using:partialsDir
+    $tid      = $using:tenantId
+    $defs     = $using:fnDefs
+    $idx      = $using:assocIndex
+    $vmTypes2 = $using:vmTypes
+    $ctr      = $using:vmCounter
+    $totSubs  = $using:totalSubs
+
+    foreach ($n in $defs.Keys) { Set-Item -Path "function:$n" -Value $defs[$n] }
+
+    $vmCsv      = Join-Path $partials "vms.$($sub.Id).csv"
+    $doneMarker = "vm-$($sub.Id)"
+
+    if (Test-SubscriptionDone -StatePath $sp -SubscriptionId $doneMarker) {
+        $ctr.done++
+        Write-Host ("  [{0,3}/{1}] {2,-40} (cached)" -f $ctr.done, $totSubs, $sub.Name) -ForegroundColor DarkGray
+        return
+    }
+    if (Test-Path $vmCsv) { Remove-Item -Force $vmCsv }
+
+    try { Set-AzContext -SubscriptionId $sub.Id -Tenant $tid -ErrorAction Stop | Out-Null }
+    catch {
+        Write-AuditError -StatePath $sp -SubscriptionId $sub.Id -Phase 'set-context-vm' -Message $_.Exception.Message
+        $ctr.done++
+        return
+    }
 
     $vms = @()
-    foreach ($t in $vmTypes) {
+    foreach ($t in $vmTypes2) {
         $vms += Get-AzResource -ResourceType $t -ErrorAction SilentlyContinue
     }
-    if (-not $vms) { continue }
-
-    Write-Host ("  {0,-40} {1,4} VM-like resource(s)" -f $sub.Name, $vms.Count) -ForegroundColor Cyan
 
     foreach ($vm in $vms) {
-        $key      = $vm.ResourceId.ToLower()
-        $entries  = @()
-        if ($assocIndex.ContainsKey($key)) {
-            # Materialise the List[object] into a plain array — some pwsh builds
-            # choke on @() over a generic list returned by a hashtable indexer.
-            $entries = @($assocIndex[$key].ToArray())
+        $key     = $vm.ResourceId.ToLower()
+        $entries = @()
+        if ($idx.ContainsKey($key)) {
+            # Wrap in @() to coerce single-element values into an array; the
+            # value is already a plain object[] (see assoc-index freeze in main
+            # thread above) so the indexer is safe across the parallel boundary.
+            $entries = @($idx[$key])
         }
+
         $dcrCount = $entries.Count
         $hasDcr   = $dcrCount -gt 0
         $hasSent  = $false
@@ -445,13 +572,11 @@ foreach ($sub in $subscriptions) {
             $dcrNames = (@($entries | Select-Object -ExpandProperty DcrName -Unique)) -join '; '
         }
 
-        # Best-effort OS hint (only present for ARM VMs when expanded; skip the extra call
-        # to keep things fast — most operators care about the association status).
         $osType = ''
-        if ($vm.Kind)                  { $osType = $vm.Kind }
+        if ($vm.Kind)                                      { $osType = $vm.Kind }
         elseif ($vm.Properties -and $vm.Properties.osType) { $osType = $vm.Properties.osType }
 
-        $vmResults.Add([pscustomobject]@{
+        $row = [pscustomobject]@{
             VmName               = $vm.Name
             VmType               = $vm.ResourceType
             ResourceId           = $vm.ResourceId
@@ -464,34 +589,41 @@ foreach ($sub in $subscriptions) {
             AssociatedDcrCount   = $dcrCount
             SendingToSentinel    = $hasSent
             AssociatedDcrNames   = $dcrNames
-        }) | Out-Null
+        }
+        Add-CsvRow -Path $vmCsv -Row $row
     }
-}
+
+    Set-SubscriptionDone -StatePath $sp -SubscriptionId $doneMarker -Stats @{ vms = $vms.Count }
+    $ctr.done++
+    Write-Host ("  [{0,3}/{1}] {2,-40} vms={3}" -f $ctr.done, $totSubs, $sub.Name, $vms.Count) -ForegroundColor Cyan
+} -ThrottleLimit $ThrottleLimit
 
 # ---------------------------------------------------------------------------
-# 4. Export
+# 4. Merge partials into final CSVs
 # ---------------------------------------------------------------------------
-Write-Host "`n[4/4] Writing CSVs..." -ForegroundColor Yellow
+Write-Host "`n[4/4] Merging partial CSVs..." -ForegroundColor Yellow
 Write-Host "  DCR CSV : $OutputPath"
-$results | Sort-Object SentinelEnabled, SubscriptionName, DcrName -Descending |
-           Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+$results = Merge-PartialCsvs -PartialsDir $partialsDir -Filter 'dcrs.*.csv' `
+                             -OutputPath $OutputPath `
+                             -SortBy @('SentinelEnabled','SubscriptionName','DcrName') -Descending
 
 Write-Host "  VM CSV  : $VmOutputPath"
-$vmResults | Sort-Object HasDcrAssociation, SubscriptionName, VmName |
-             Export-Csv -Path $VmOutputPath -NoTypeInformation -Encoding UTF8
+$vmResults = Merge-PartialCsvs -PartialsDir $partialsDir -Filter 'vms.*.csv' `
+                               -OutputPath $VmOutputPath `
+                               -SortBy @('HasDcrAssociation','SubscriptionName','VmName')
 
 # ---------------------------------------------------------------------------
 # Console summary
 # ---------------------------------------------------------------------------
 $total           = $results.Count
-$toSentinel      = ($results | Where-Object SentinelEnabled).Count
-$nonSentinel     = ($results | Where-Object { -not $_.SentinelEnabled }).Count
+$toSentinel      = ($results | Where-Object { $_.SentinelEnabled -eq 'True' }).Count
+$nonSentinel     = ($results | Where-Object { $_.SentinelEnabled -ne 'True' }).Count
 $totalAssocs     = ($results | Measure-Object -Property AssociationCount -Sum).Sum
-$collectingSec   = ($results | Where-Object CollectsWindowsSecurityLog).Count
+$collectingSec   = ($results | Where-Object { $_.CollectsWindowsSecurityLog -eq 'True' }).Count
 
 $totalVms        = $vmResults.Count
-$vmsNoDcr        = ($vmResults | Where-Object { -not $_.HasDcrAssociation }).Count
-$vmsNoSentinel   = ($vmResults | Where-Object { -not $_.SendingToSentinel }).Count
+$vmsNoDcr        = ($vmResults | Where-Object { $_.HasDcrAssociation -ne 'True' }).Count
+$vmsNoSentinel   = ($vmResults | Where-Object { $_.SendingToSentinel -ne 'True' }).Count
 
 Write-Host "`nDone." -ForegroundColor Green
 Write-Host "  DCRs inventoried                     : $total"
@@ -507,7 +639,7 @@ Write-Host "  VM  CSV                              : $VmOutputPath"
 
 if ($sentinelWorkspaces.Count -gt 1) {
     Write-Host "`n  Breakdown by Sentinel workspace:" -ForegroundColor Cyan
-    $results | Where-Object SentinelEnabled |
+    $results | Where-Object { $_.SentinelEnabled -eq 'True' } |
                ForEach-Object { ($_.SentinelWorkspaces -split '; ') } |
                Where-Object { $_ } |
                Group-Object |
@@ -515,4 +647,23 @@ if ($sentinelWorkspaces.Count -gt 1) {
                ForEach-Object {
                    Write-Host ("    {0,-40} {1,5} DCRs" -f $_.Name, $_.Count)
                }
+}
+
+# ---------------------------------------------------------------------------
+# Optional state cleanup
+# ---------------------------------------------------------------------------
+$errorsFile = Join-Path $StatePath 'errors/errors.jsonl'
+if (Test-Path $errorsFile) {
+    $errCount = (Get-Content $errorsFile | Measure-Object -Line).Lines
+    if ($errCount -gt 0) {
+        Write-Warning "  $errCount non-fatal error(s) recorded in $errorsFile"
+    }
+}
+
+if ($CleanState) {
+    if (Test-Path $errorsFile) {
+        Copy-Item -Path $errorsFile -Destination ($OutputPath + '.errors.jsonl') -Force
+    }
+    Remove-Item -Path $StatePath -Recurse -Force
+    Write-Host "  State directory removed (-CleanState)." -ForegroundColor DarkGray
 }
