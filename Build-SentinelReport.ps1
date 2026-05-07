@@ -58,15 +58,23 @@ if (-not $rows) {
 # Normalise the SentinelEnabled column (CSV stores booleans as strings)
 foreach ($r in $rows) {
     $r.SentinelEnabled = ($r.SentinelEnabled -eq 'True')
+    if (-not ($r.PSObject.Properties.Name -contains 'DiagnosticSupport') -or [string]::IsNullOrWhiteSpace($r.DiagnosticSupport)) {
+        # Backwards compat: old CSVs without the column are all 'Configured'.
+        $r | Add-Member -NotePropertyName DiagnosticSupport -NotePropertyValue 'Configured' -Force
+    }
 }
 
 # ---- Summary stats --------------------------------------------------------
 $totalRows         = $rows.Count
-$sendingRows       = @($rows | Where-Object { $_.SentinelEnabled })
-$notSendingRows    = @($rows | Where-Object { -not $_.SentinelEnabled })
+$configuredRows    = @($rows | Where-Object { $_.DiagnosticSupport -eq 'Configured' })
+$sendingRows       = @($configuredRows | Where-Object { $_.SentinelEnabled })
+$notSendingRows    = @($configuredRows | Where-Object { -not $_.SentinelEnabled })
+$noSettingRows     = @($rows | Where-Object { $_.DiagnosticSupport -ne 'Configured' })
 
 $uniqueResSending     = ($sendingRows    | Select-Object ResourceName,ResourceGroup,SubscriptionName -Unique).Count
 $uniqueResNotSending  = ($notSendingRows | Select-Object ResourceName,ResourceGroup,SubscriptionName -Unique).Count
+$uniqueResNoSetting   = ($noSettingRows  | Select-Object ResourceName,ResourceGroup,SubscriptionName -Unique).Count
+$uniqueResScanned     = ($rows           | Select-Object ResourceName,ResourceGroup,SubscriptionName -Unique).Count
 
 # Per-Sentinel-workspace breakdown
 $workspaceBreakdown = $sendingRows |
@@ -90,12 +98,15 @@ $generated = Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'
 # ---- Build JSON payloads for embedded JS ----------------------------------
 $sendingJson    = $sendingRows    | ConvertTo-Json -Depth 4 -Compress
 $notSendingJson = $notSendingRows | ConvertTo-Json -Depth 4 -Compress
+$noSettingJson  = $noSettingRows  | ConvertTo-Json -Depth 4 -Compress
 
 # Single-row arrays come back as objects, not arrays. Force array shape.
 if ($sendingRows.Count    -eq 1) { $sendingJson    = "[$sendingJson]" }
 if ($notSendingRows.Count -eq 1) { $notSendingJson = "[$notSendingJson]" }
+if ($noSettingRows.Count  -eq 1) { $noSettingJson  = "[$noSettingJson]" }
 if ($sendingRows.Count    -eq 0) { $sendingJson    = '[]' }
 if ($notSendingRows.Count -eq 0) { $notSendingJson = '[]' }
+if ($noSettingRows.Count  -eq 0) { $noSettingJson  = '[]' }
 
 $workspaceRowsHtml = if ($workspaceBreakdown) {
     ($workspaceBreakdown | ForEach-Object {
@@ -392,7 +403,7 @@ $html = @"
   <div class="meta">
     <span class="pulse">live snapshot</span>
     <span class="ts">generated $generated</span>
-    <span class="ts">$totalRows diagnostic rows · $($workspaceBreakdown.Count) Sentinel workspace(s)</span>
+    <span class="ts">$totalRows rows · $uniqueResScanned resources scanned · $($workspaceBreakdown.Count) Sentinel workspace(s)</span>
   </div>
 </header>
 
@@ -400,6 +411,11 @@ $html = @"
 
   <!-- KPI strip -->
   <div class="kpis">
+    <div class="kpi">
+      <div class="label">Resources scanned</div>
+      <div class="value">$uniqueResScanned</div>
+      <div class="delta">unique resources covered by this audit</div>
+    </div>
     <div class="kpi good">
       <div class="label">→ Sentinel</div>
       <div class="value">$($sendingRows.Count)</div>
@@ -408,14 +424,14 @@ $html = @"
     <div class="kpi bad">
       <div class="label">Not → Sentinel</div>
       <div class="value">$($notSendingRows.Count)</div>
-      <div class="delta">$uniqueResNotSending unique resources with diagnostics elsewhere or unrouted</div>
-    </div>
-    <div class="kpi">
-      <div class="label">Total rows</div>
-      <div class="value">$totalRows</div>
-      <div class="delta">one row per resource × diagnostic setting</div>
+      <div class="delta">$uniqueResNotSending resources with diagnostics elsewhere</div>
     </div>
     <div class="kpi warn">
+      <div class="label">No setting</div>
+      <div class="value">$($noSettingRows.Count)</div>
+      <div class="delta">$uniqueResNoSetting resources with no diagnostic setting configured / supported</div>
+    </div>
+    <div class="kpi">
       <div class="label">Sentinel WS</div>
       <div class="value">$($workspaceBreakdown.Count)</div>
       <div class="delta">workspaces with SecurityInsights solution attached</div>
@@ -449,6 +465,9 @@ $gapRowsHtml
     </button>
     <button class="tab" data-view="notsending">
       Not sending to Sentinel <span class="count" id="cnt-notsending">$($notSendingRows.Count)</span>
+    </button>
+    <button class="tab" data-view="nosetting">
+      No diagnostic setting <span class="count" id="cnt-nosetting">$($noSettingRows.Count)</span>
     </button>
   </div>
 
@@ -497,6 +516,24 @@ $gapRowsHtml
     </div>
   </section>
 
+  <section class="view" id="view-nosetting">
+    <div class="table-wrap">
+      <table class="data" id="tbl-nosetting">
+        <thead>
+          <tr>
+            <th>Resource</th>
+            <th>Type</th>
+            <th>Diagnostic Setting</th>
+            <th>State</th>
+            <th>Subscription / RG</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
   <footer>
     <span>Audit · $generated</span>
     <span>Source CSV · $([System.IO.Path]::GetFileName($InputCsv))</span>
@@ -506,6 +543,7 @@ $gapRowsHtml
 <script>
   const SENDING     = $sendingJson;
   const NOT_SENDING = $notSendingJson;
+  const NO_SETTING  = $noSettingJson;
 
   function escapeHtml(s){
     if (s === null || s === undefined) return '';
@@ -547,6 +585,26 @@ $gapRowsHtml
       + '</tr>';
   }
 
+  function renderNoSettingRow(r){
+    const support = r.DiagnosticSupport || 'NotConfigured';
+    const stateLabel = support === 'NotSupported'
+      ? 'resource type does not support diagnostic settings'
+      : 'diagnostic settings not configured';
+    const stateClass = support === 'NotSupported' ? 'chip empty' : 'chip empty';
+    const badge = support === 'NotSupported'
+      ? '<span class="badge" style="color:var(--ink-muted)">unsupported</span>'
+      : '<span class="badge no">no setting</span>';
+    return '<tr class="not-sending">'
+      + '<td><div class="resname">' + escapeHtml(r.ResourceName) + '</div></td>'
+      + '<td><span class="restype">' + escapeHtml(r.ResourceType) + '</span></td>'
+      + '<td><span class="sub">—</span></td>'
+      + '<td><span class="' + stateClass + '">' + escapeHtml(stateLabel) + '</span></td>'
+      + '<td><div>' + escapeHtml(r.SubscriptionName) + '</div>'
+      +   '<div class="sub">' + escapeHtml(r.ResourceGroup) + '</div></td>'
+      + '<td>' + badge + '</td>'
+      + '</tr>';
+  }
+
   function rowMatches(r, q){
     if (!q) return true;
     const hay = [
@@ -560,9 +618,11 @@ $gapRowsHtml
     const q = document.getElementById('filter').value.trim().toLowerCase();
     const sBody = document.querySelector('#tbl-sending tbody');
     const nBody = document.querySelector('#tbl-notsending tbody');
+    const xBody = document.querySelector('#tbl-nosetting tbody');
 
     const sFilt = SENDING.filter(r => rowMatches(r, q));
     const nFilt = NOT_SENDING.filter(r => rowMatches(r, q));
+    const xFilt = NO_SETTING.filter(r => rowMatches(r, q));
 
     sBody.innerHTML = sFilt.length
       ? sFilt.map(r => renderRow(r, true)).join('')
@@ -570,9 +630,13 @@ $gapRowsHtml
     nBody.innerHTML = nFilt.length
       ? nFilt.map(r => renderRow(r, false)).join('')
       : '<tr><td colspan="6" class="empty-state">Nothing matches — every resource in this filter is reaching Sentinel.</td></tr>';
+    xBody.innerHTML = xFilt.length
+      ? xFilt.map(r => renderNoSettingRow(r)).join('')
+      : '<tr><td colspan="6" class="empty-state">No matching resources without a diagnostic setting.</td></tr>';
 
     document.getElementById('cnt-sending').textContent    = sFilt.length;
     document.getElementById('cnt-notsending').textContent = nFilt.length;
+    document.getElementById('cnt-nosetting').textContent  = xFilt.length;
   }
 
   // Tabs
@@ -592,10 +656,13 @@ $gapRowsHtml
   document.getElementById('btn-export').addEventListener('click', () => {
     const q = document.getElementById('filter').value.trim().toLowerCase();
     const activeView = document.querySelector('.tab.active').dataset.view;
-    const data = (activeView === 'sending' ? SENDING : NOT_SENDING).filter(r => rowMatches(r, q));
+    const source = activeView === 'sending'    ? SENDING
+                 : activeView === 'notsending' ? NOT_SENDING
+                 :                               NO_SETTING;
+    const data = source.filter(r => rowMatches(r, q));
     if (!data.length){ alert('Nothing to export.'); return; }
     const cols = ['ResourceName','ResourceType','LogAnalyticsWorkspace','SentinelWorkspaceName',
-                  'DiagnosticData','SentinelEnabled','DiagnosticSettingName','SubscriptionName',
+                  'DiagnosticData','DiagnosticSupport','SentinelEnabled','DiagnosticSettingName','SubscriptionName',
                   'ResourceGroup','WorkspaceResourceId'];
     const esc = v => {
       if (v === null || v === undefined) return '';
@@ -623,5 +690,6 @@ $html | Out-File -FilePath $OutputHtml -Encoding utf8
 Write-Host "`nReport written: $OutputHtml" -ForegroundColor Green
 Write-Host "  Sending to Sentinel    : $($sendingRows.Count) rows ($uniqueResSending unique resources)"
 Write-Host "  Not sending to Sentinel: $($notSendingRows.Count) rows ($uniqueResNotSending unique resources)"
+Write-Host "  No diagnostic setting  : $($noSettingRows.Count) rows ($uniqueResNoSetting unique resources)"
 Write-Host "  Sentinel workspaces    : $($workspaceBreakdown.Count)"
 Write-Host "`nIn Cloud Shell, download with: download $OutputHtml" -ForegroundColor Cyan

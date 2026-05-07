@@ -181,61 +181,148 @@ $subscriptions | ForEach-Object -Parallel {
         return
     }
 
-    $resources = Get-AzResource -ErrorAction SilentlyContinue
-    $rowCount  = 0
+    # Local helper: build a row from a single Get-AzDiagnosticSetting result.
+    $buildSettingRow = {
+        param($s, $resName, $resType, $rgName)
+        $logCats = @()
+        if ($s.Log) {
+            $logCats = $s.Log | Where-Object { $_.Enabled } | ForEach-Object { $_.Category }
+        }
+        $metricCats = @()
+        if ($s.Metric) {
+            $metricCats = $s.Metric | Where-Object { $_.Enabled } | ForEach-Object { "metric:$($_.Category)" }
+        }
+        $diagData = (@($logCats) + @($metricCats)) -join '; '
+        if ([string]::IsNullOrWhiteSpace($diagData)) { $diagData = '(none enabled)' }
 
+        $wsId           = $s.WorkspaceId
+        $wsName         = if ($wsId) { ($wsId -split '/')[-1] } else { '' }
+        $isSentinel     = $false
+        $sentinelWsName = ''
+        if ($wsId -and $wsMap.ContainsKey($wsId.ToLower())) {
+            $isSentinel     = $true
+            $sentinelWsName = $wsMap[$wsId.ToLower()]
+        }
+
+        [pscustomobject]@{
+            ResourceName          = $resName
+            ResourceType          = $resType
+            LogAnalyticsWorkspace = $wsName
+            DiagnosticData        = $diagData
+            SentinelEnabled       = $isSentinel
+            SentinelWorkspaceName = $sentinelWsName
+            DiagnosticSettingName = $s.Name
+            SubscriptionName      = $sub.Name
+            ResourceGroup         = $rgName
+            WorkspaceResourceId   = $wsId
+            DiagnosticSupport     = 'Configured'
+        }
+    }
+
+    # Local helper: build a placeholder row for resources with no setting / unsupported.
+    $buildPlaceholderRow = {
+        param($resName, $resType, $rgName, $support)
+        $diagData = if ($support -eq 'NotSupported') {
+            '(diagnostic settings not supported)'
+        } else {
+            '(no diagnostic setting configured)'
+        }
+        [pscustomobject]@{
+            ResourceName          = $resName
+            ResourceType          = $resType
+            LogAnalyticsWorkspace = ''
+            DiagnosticData        = $diagData
+            SentinelEnabled       = $false
+            SentinelWorkspaceName = ''
+            DiagnosticSettingName = ''
+            SubscriptionName      = $sub.Name
+            ResourceGroup         = $rgName
+            WorkspaceResourceId   = ''
+            DiagnosticSupport     = $support
+        }
+    }
+
+    $resources = Get-AzResource -ErrorAction SilentlyContinue
+    $rowCount      = 0
+    $countConfig   = 0
+    $countNoConfig = 0
+    $countNoSupp   = 0
+
+    # ---- Subscription-level (Activity Log) diagnostic settings ----
+    $subSettings = $null
+    $subSupport  = 'Configured'
+    try {
+        $subSettings = Get-AzDiagnosticSetting -ResourceId "/subscriptions/$($sub.Id)" -ErrorAction Stop
+    } catch {
+        $subSupport = 'NotSupported'
+    }
+    if ($subSettings) {
+        foreach ($s in $subSettings) {
+            $row = & $buildSettingRow $s "Activity Log: $($sub.Name)" 'Microsoft.Resources/subscriptions/providers/diagnosticSettings' '(subscription scope)'
+            Add-CsvRow -Path $diagCsv -Row $row
+            $rowCount++; $countConfig++
+        }
+    } else {
+        if ($subSupport -eq 'Configured') { $subSupport = 'NotConfigured' }
+        $row = & $buildPlaceholderRow "Activity Log: $($sub.Name)" 'Microsoft.Resources/subscriptions/providers/diagnosticSettings' '(subscription scope)' $subSupport
+        Add-CsvRow -Path $diagCsv -Row $row
+        $rowCount++
+        if ($subSupport -eq 'NotSupported') { $countNoSupp++ } else { $countNoConfig++ }
+    }
+
+    # ---- Resource-group-level diagnostic settings (best effort) ----
+    # RGs almost never carry their own diagnostic settings, so we only emit a
+    # row when the API returns one. Failures and empty results are silent to
+    # avoid bloating the report.
+    try {
+        $rgs = Get-AzResourceGroup -ErrorAction SilentlyContinue
+        foreach ($rg in $rgs) {
+            $rgSettings = $null
+            try {
+                $rgSettings = Get-AzDiagnosticSetting -ResourceId $rg.ResourceId -ErrorAction Stop
+            } catch { continue }
+            if (-not $rgSettings) { continue }
+            foreach ($s in $rgSettings) {
+                $row = & $buildSettingRow $s $rg.ResourceGroupName 'Microsoft.Resources/resourceGroups' $rg.ResourceGroupName
+                Add-CsvRow -Path $diagCsv -Row $row
+                $rowCount++; $countConfig++
+            }
+        }
+    } catch {
+        Write-AuditError -StatePath $sp -SubscriptionId $sub.Id -Phase 'rg-diag' -Message $_.Exception.Message
+    }
+
+    # ---- Per-resource diagnostic settings ----
     foreach ($res in $resources) {
         $settings = $null
+        $support  = 'Configured'
         try {
             $settings = Get-AzDiagnosticSetting -ResourceId $res.ResourceId -ErrorAction Stop
         } catch {
             # Most ARM 404s land here (resource type doesn't support diagnostic settings).
-            continue
+            $support = 'NotSupported'
         }
-        if (-not $settings) { continue }
 
-        foreach ($s in $settings) {
-            $logCats = @()
-            if ($s.Log) {
-                $logCats = $s.Log | Where-Object { $_.Enabled } | ForEach-Object { $_.Category }
-            }
-            $metricCats = @()
-            if ($s.Metric) {
-                $metricCats = $s.Metric | Where-Object { $_.Enabled } | ForEach-Object { "metric:$($_.Category)" }
-            }
-            $diagData = (@($logCats) + @($metricCats)) -join '; '
-            if ([string]::IsNullOrWhiteSpace($diagData)) { $diagData = '(none enabled)' }
-
-            $wsId           = $s.WorkspaceId
-            $wsName         = if ($wsId) { ($wsId -split '/')[-1] } else { '' }
-            $isSentinel     = $false
-            $sentinelWsName = ''
-            if ($wsId -and $wsMap.ContainsKey($wsId.ToLower())) {
-                $isSentinel     = $true
-                $sentinelWsName = $wsMap[$wsId.ToLower()]
-            }
-
-            $row = [pscustomobject]@{
-                ResourceName          = $res.Name
-                ResourceType          = $res.ResourceType
-                LogAnalyticsWorkspace = $wsName
-                DiagnosticData        = $diagData
-                SentinelEnabled       = $isSentinel
-                SentinelWorkspaceName = $sentinelWsName
-                DiagnosticSettingName = $s.Name
-                SubscriptionName      = $sub.Name
-                ResourceGroup         = $res.ResourceGroupName
-                WorkspaceResourceId   = $wsId
-            }
+        if (-not $settings) {
+            if ($support -eq 'Configured') { $support = 'NotConfigured' }
+            $row = & $buildPlaceholderRow $res.Name $res.ResourceType $res.ResourceGroupName $support
             Add-CsvRow -Path $diagCsv -Row $row
             $rowCount++
+            if ($support -eq 'NotSupported') { $countNoSupp++ } else { $countNoConfig++ }
+            continue
+        }
+
+        foreach ($s in $settings) {
+            $row = & $buildSettingRow $s $res.Name $res.ResourceType $res.ResourceGroupName
+            Add-CsvRow -Path $diagCsv -Row $row
+            $rowCount++; $countConfig++
         }
     }
 
     Set-SubscriptionDone -StatePath $sp -SubscriptionId $doneMarker `
-                         -Stats @{ resources = $resources.Count; rows = $rowCount }
+                         -Stats @{ resources = $resources.Count; rows = $rowCount; configured = $countConfig; notConfigured = $countNoConfig; notSupported = $countNoSupp }
     $ctr.done++
-    Write-Host ("  [{0,3}/{1}] {2,-40} resources={3,-5} rows={4}" -f $ctr.done, $totSubs, $sub.Name, $resources.Count, $rowCount) -ForegroundColor Cyan
+    Write-Host ("  [{0,3}/{1}] {2,-40} res={3,-5} cfg={4,-4} none={5,-4} n/a={6,-4}" -f $ctr.done, $totSubs, $sub.Name, $resources.Count, $countConfig, $countNoConfig, $countNoSupp) -ForegroundColor Cyan
 } -ThrottleLimit $ThrottleLimit
 
 # ---------------------------------------------------------------------------
@@ -286,6 +373,7 @@ if (Test-SubscriptionDone -StatePath $StatePath -SubscriptionId $entraDoneMarker
                         SubscriptionName      = '(tenant scope)'
                         ResourceGroup         = '(tenant scope)'
                         WorkspaceResourceId   = $wsId
+                        DiagnosticSupport     = 'Configured'
                     }
                     Add-CsvRow -Path $entraCsv -Row $row
                     Write-Host "  Found Entra setting '$($ds.name)' -> $wsName  Sentinel=$isSentinel" -ForegroundColor Green
@@ -319,6 +407,7 @@ if (Test-SubscriptionDone -StatePath $StatePath -SubscriptionId $entraDoneMarker
                     SubscriptionName      = '(tenant scope)'
                     ResourceGroup         = '(tenant scope)'
                     WorkspaceResourceId   = ''
+                    DiagnosticSupport     = 'NotConfigured'
                 }
                 Add-CsvRow -Path $entraCsv -Row $row
             }
@@ -350,11 +439,17 @@ $results = Merge-PartialCsvs -PartialsDir $partialsDir -Filter 'diag.*.csv' `
 $total            = $results.Count
 $toSentinel       = ($results | Where-Object { $_.SentinelEnabled -eq 'True' }).Count
 $uniqueResources  = ($results | Select-Object ResourceName -Unique).Count
+$noSetting        = ($results | Where-Object { $_.DiagnosticSupport -eq 'NotConfigured' }).Count
+$notSupported     = ($results | Where-Object { $_.DiagnosticSupport -eq 'NotSupported' }).Count
+$configured       = ($results | Where-Object { $_.DiagnosticSupport -eq 'Configured' }).Count
 
 Write-Host "`nDone." -ForegroundColor Green
-Write-Host "  Diagnostic-setting rows recorded : $total"
+Write-Host "  Total rows recorded              : $total"
 Write-Host "  Unique resources                 : $uniqueResources"
+Write-Host "  Rows with configured settings    : $configured"
 Write-Host "  Rows targeting a Sentinel WS     : $toSentinel"
+Write-Host "  Rows w/ no diagnostic setting    : $noSetting"
+Write-Host "  Rows w/ unsupported resource type: $notSupported"
 Write-Host "  CSV saved to                     : $OutputPath"
 
 if ($sentinelWorkspaces.Count -gt 1) {
